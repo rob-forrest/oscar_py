@@ -175,7 +175,7 @@ class StatisticsCalculator:
         return summary
 
     def _calculate_day_summary(self, day_date: date, day) -> DaySummary:
-        """Calculate summary statistics for a day.
+        """Calculate summary statistics for a day using Day aggregation methods.
 
         Args:
             day_date: The date.
@@ -189,84 +189,30 @@ class StatisticsCalculator:
         if not hasattr(day, 'sessions') or not day.sessions:
             return summary
 
-        total_hours = 0.0
-        total_oa = 0
-        total_ca = 0
-        total_h = 0
-        total_rera = 0
+        # Use Day's aggregation methods for consistent calculations
+        summary.hours = day.hours(MachineType.MT_CPAP) if hasattr(day, 'hours') else 0.0
 
-        pressure_values = []
-        leak_values = []
-        pressure_mins = []
-        pressure_maxs = []
+        if summary.hours <= 0:
+            return summary
 
-        for session in day.sessions:
-            if not hasattr(session, 'enabled') or not session.enabled:
-                continue
+        # Event counts via Day.count()
+        summary.oa_count = int(day.count(CPAP_Obstructive))
+        summary.ca_count = int(day.count(CPAP_ClearAirway))
+        summary.h_count = int(day.count(CPAP_Hypopnea))
+        summary.rera_count = int(day.count(CPAP_RERA))
 
-            # Get hours
-            hours = 0.0
-            if hasattr(session, 'hours'):
-                hours = session.hours()
-            elif hasattr(session, 'duration'):
-                hours = session.duration()
+        # AHI via Day.calc_ahi()
+        summary.ahi = day.calc_ahi() if hasattr(day, 'calc_ahi') else (
+            summary.total_events / summary.hours if summary.hours > 0 else 0.0
+        )
 
-            if hours <= 0:
-                continue
+        # Pressure stats
+        summary.pressure_avg = day.wavg(CPAP_Pressure)
+        summary.pressure_min = day.min_val(CPAP_Pressure)
+        summary.pressure_max = day.max_val(CPAP_Pressure)
 
-            total_hours += hours
-
-            # Get event counts
-            if hasattr(session, 'count'):
-                total_oa += int(session.count(CPAP_Obstructive) or 0)
-                total_ca += int(session.count(CPAP_ClearAirway) or 0)
-                total_h += int(session.count(CPAP_Hypopnea) or 0)
-                total_rera += int(session.count(CPAP_RERA) or 0)
-
-            # Get pressure stats
-            if hasattr(session, 'avg'):
-                pressure_avg = session.avg(CPAP_Pressure)
-                if pressure_avg > 0:
-                    pressure_values.append(pressure_avg)
-
-            if hasattr(session, 'min_value'):
-                pressure_min = session.min_value(CPAP_Pressure)
-                if pressure_min > 0:
-                    pressure_mins.append(pressure_min)
-
-            if hasattr(session, 'max_value'):
-                pressure_max = session.max_value(CPAP_Pressure)
-                if pressure_max > 0:
-                    pressure_maxs.append(pressure_max)
-
-            # Get leak stats
-            if hasattr(session, 'avg'):
-                leak_avg = session.avg(CPAP_Leak)
-                if leak_avg >= 0:
-                    leak_values.append(leak_avg)
-
-        # Populate summary
-        summary.hours = total_hours
-        summary.oa_count = total_oa
-        summary.ca_count = total_ca
-        summary.h_count = total_h
-        summary.rera_count = total_rera
-
-        # Calculate AHI
-        if total_hours > 0:
-            summary.ahi = (total_oa + total_ca + total_h) / total_hours
-
-        # Calculate pressure stats
-        if pressure_values:
-            summary.pressure_avg = sum(pressure_values) / len(pressure_values)
-        if pressure_mins:
-            summary.pressure_min = min(pressure_mins)
-        if pressure_maxs:
-            summary.pressure_max = max(pressure_maxs)
-
-        # Calculate leak average
-        if leak_values:
-            summary.leak_avg = sum(leak_values) / len(leak_values)
+        # Leak average
+        summary.leak_avg = day.wavg(CPAP_Leak)
 
         return summary
 

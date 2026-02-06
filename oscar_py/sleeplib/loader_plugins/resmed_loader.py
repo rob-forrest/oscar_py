@@ -1234,6 +1234,19 @@ class ResmedLoader:
             if session.last is None and session.first:
                 session.last = session.first
 
+            # Mark events as loaded since we just populated them
+            if hasattr(session, '_events_loaded'):
+                session._events_loaded = True
+
+            # Run derived channel calculations if sleeplib is available
+            if HAS_SLEEPLIB:
+                try:
+                    from ..calcs import calc_resp_rate, calc_ahi_graph
+                    calc_resp_rate(session)
+                    calc_ahi_graph(session)
+                except Exception as e:
+                    logger.debug(f"Derived channel calculation skipped: {e}")
+
             sessions.append(session)
             machine.sessionlist[session.session_id] = session
 

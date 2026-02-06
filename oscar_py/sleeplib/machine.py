@@ -19,7 +19,9 @@ import xml.etree.ElementTree as ET
 
 from .preferences import Preferences
 from .schema import (
-    MachineType, MachineID, SessionID, ChannelID, ChanType
+    MachineType, MachineID, SessionID, ChannelID, ChanType,
+    CPAPMode, AllAhiChannels,
+    CPAP_Mode, CPAP_Pressure, CPAP_IPAP, CPAP_EPAP, CPAP_RERA,
 )
 
 # Import the full Session implementation
@@ -83,37 +85,374 @@ class MachineInfo:
 
 
 class Day:
-    """Represents a single day's worth of data.
+    """Represents a single day's worth of data, aggregating multiple sessions.
 
-    This is a placeholder class - the full implementation would include
-    aggregation of sessions, statistics calculations, etc.
+    This is the primary aggregation layer that combines multi-session data
+    into daily statistics (AHI, hours, pressure, percentiles, etc.).
+    Ported from C++ Day class (~1,700 lines).
     """
 
     def __init__(self, date_val: date):
-        """Initialize a Day.
-
-        Args:
-            date_val: The date this day represents
-        """
         self.date = date_val
         self.sessions: List[Session] = []
         self.machines: List['Machine'] = []
+        self._invalidated = True
+        self._cache: Dict[str, Any] = {}
 
     def add_session(self, session: Session) -> None:
         """Add a session to this day."""
         self.sessions.append(session)
         if session.machine not in self.machines:
             self.machines.append(session.machine)
+        self._invalidated = True
+
+    def invalidate(self) -> None:
+        """Clear cached values, forcing recalculation."""
+        self._invalidated = True
+        self._cache.clear()
 
     def has_data(self, machine_type: MachineType = MachineType.MT_UNKNOWN) -> bool:
         """Check if this day has data for the given machine type."""
         if machine_type == MachineType.MT_UNKNOWN:
             return len(self.sessions) > 0
+        return any(s.machine.type == machine_type for s in self.sessions)
 
-        for session in self.sessions:
-            if session.machine.type == machine_type:
+    # ---- Session filtering ----
+
+    def get_sessions(self, mtype: Optional[MachineType] = None) -> List[Session]:
+        """Return enabled sessions, optionally filtered by machine type."""
+        result = []
+        for s in self.sessions:
+            if not s.enabled:
+                continue
+            if mtype is not None and s.machine.type != mtype:
+                continue
+            result.append(s)
+        return result
+
+    def has_enabled_sessions(self, mtype: Optional[MachineType] = None) -> bool:
+        """Check if any enabled sessions exist for the given machine type."""
+        return len(self.get_sessions(mtype)) > 0
+
+    # ---- Time / Duration ----
+
+    def first(self, mtype: Optional[MachineType] = None) -> int:
+        """Return earliest session start time (ms epoch)."""
+        earliest = 0
+        for s in self.get_sessions(mtype):
+            t = s.first_time
+            if t and (earliest == 0 or t < earliest):
+                earliest = t
+        return earliest
+
+    def last(self, mtype: Optional[MachineType] = None) -> int:
+        """Return latest session end time (ms epoch)."""
+        latest = 0
+        for s in self.get_sessions(mtype):
+            t = s.last_time
+            if t and t > latest:
+                latest = t
+        return latest
+
+    def total_time(self, mtype: Optional[MachineType] = None) -> int:
+        """Return total duration in ms, handling overlapping sessions.
+
+        Uses brace-counting: opens at session starts, closes at session ends.
+        Overlapping intervals are counted only once.
+        """
+        cache_key = f'total_time_{mtype}'
+        if not self._invalidated and cache_key in self._cache:
+            return self._cache[cache_key]
+
+        # Build sorted list of (timestamp, is_close) pairs
+        # is_close=False for open, True for close
+        ranges: List[tuple] = []
+        for s in self.get_sessions(mtype):
+            if s.slices:
+                from .session import SliceStatus
+                for sl in s.slices:
+                    if sl.status == SliceStatus.MaskOn:
+                        ranges.append((sl.start, False))
+                        ranges.append((sl.end, True))
+            else:
+                if s.first_time and s.last_time:
+                    ranges.append((s.first_time, False))
+                    ranges.append((s.last_time, True))
+
+        if not ranges:
+            self._cache[cache_key] = 0
+            return 0
+
+        # Sort by timestamp, closes before opens at same time
+        ranges.sort(key=lambda x: (x[0], 0 if x[1] else 1))
+
+        total = 0
+        nest = 0
+        ti = 0
+        for timestamp, is_close in ranges:
+            if is_close:
+                nest -= 1
+                if nest <= 0:
+                    total += timestamp - ti
+                    nest = 0
+            else:
+                if nest == 0:
+                    ti = timestamp
+                nest += 1
+
+        self._cache[cache_key] = total
+        return total
+
+    def hours(self, mtype: Optional[MachineType] = None) -> float:
+        """Return total duration in decimal hours."""
+        cache_key = f'hours_{mtype}'
+        if not self._invalidated and cache_key in self._cache:
+            return self._cache[cache_key]
+        h = self.total_time(mtype) / 3600000.0
+        self._cache[cache_key] = h
+        if mtype is not None:
+            self._invalidated = False
+        return h
+
+    # ---- Channel aggregation across sessions ----
+
+    def count(self, channel_id: ChannelID) -> float:
+        """Return sum of event counts for channel across enabled sessions."""
+        cache_key = f'cnt_{channel_id}'
+        if not self._invalidated and cache_key in self._cache:
+            return self._cache[cache_key]
+        total = 0.0
+        for s in self.get_sessions():
+            total += s.count(channel_id)
+        self._cache[cache_key] = total
+        return total
+
+    def sum_values(self, channel_id: ChannelID) -> float:
+        """Return sum of all values for channel across enabled sessions."""
+        cache_key = f'sum_{channel_id}'
+        if not self._invalidated and cache_key in self._cache:
+            return self._cache[cache_key]
+        total = 0.0
+        for s in self.get_sessions():
+            total += s.sum_values(channel_id)
+        self._cache[cache_key] = total
+        return total
+
+    def avg(self, channel_id: ChannelID) -> float:
+        """Return weighted average (by event count) across sessions."""
+        total_cnt = 0.0
+        total_sum = 0.0
+        for s in self.get_sessions():
+            cnt = s.count(channel_id)
+            if cnt > 0:
+                total_sum += s.avg(channel_id) * cnt
+                total_cnt += cnt
+        return total_sum / total_cnt if total_cnt > 0 else 0.0
+
+    def wavg(self, channel_id: ChannelID) -> float:
+        """Return time-weighted average (weight by session duration)."""
+        total_weight = 0.0
+        total_sum = 0.0
+        for s in self.get_sessions():
+            h = s.hours()
+            if h > 0:
+                total_sum += s.avg(channel_id) * h
+                total_weight += h
+        return total_sum / total_weight if total_weight > 0 else 0.0
+
+    def min_val(self, channel_id: ChannelID) -> float:
+        """Return minimum value across all sessions."""
+        result = None
+        for s in self.get_sessions():
+            v = s.min_value(channel_id)
+            if v != 0 and (result is None or v < result):
+                result = v
+        return result if result is not None else 0.0
+
+    def max_val(self, channel_id: ChannelID) -> float:
+        """Return maximum value across all sessions."""
+        result = None
+        for s in self.get_sessions():
+            v = s.max_value(channel_id)
+            if v != 0 and (result is None or v > result):
+                result = v
+        return result if result is not None else 0.0
+
+    def cph(self, channel_id: ChannelID) -> float:
+        """Return count per hour for channel."""
+        h = self.hours(MachineType.MT_CPAP)
+        return self.count(channel_id) / h if h > 0 else 0.0
+
+    def sph(self, channel_id: ChannelID) -> float:
+        """Return sum per hour (percent of night) for channel."""
+        h = self.hours(MachineType.MT_CPAP)
+        if h <= 0:
+            return 0.0
+        return (self.sum_values(channel_id) / 3600.0) * (100.0 / h)
+
+    def percentile(self, channel_id: ChannelID, p: float) -> float:
+        """Return weighted percentile from session value distributions.
+
+        Collects all values from all sessions and computes percentile.
+        For efficiency, uses session-level min/max/avg when event data
+        isn't loaded; uses raw data when available.
+
+        Args:
+            channel_id: Channel to compute percentile for.
+            p: Percentile as fraction 0.0-1.0.
+        """
+        import numpy as np
+        all_values = []
+        for s in self.get_sessions():
+            evlists = s.get_event_list(channel_id)
+            if not evlists:
+                continue
+            for evl in evlists:
+                if evl.count > 0:
+                    phys = evl.physical_data()
+                    all_values.append(phys)
+        if not all_values:
+            return 0.0
+        combined = np.concatenate(all_values)
+        if len(combined) == 0:
+            return 0.0
+        return float(np.percentile(combined, p * 100.0))
+
+    def p90(self, channel_id: ChannelID) -> float:
+        """Return 90th percentile for channel."""
+        return self.percentile(channel_id, 0.90)
+
+    # ---- CPAP-specific indices ----
+
+    def calc_ahi(self) -> float:
+        """Calculate AHI (Apnea-Hypopnea Index) for this day."""
+        h = self.hours(MachineType.MT_CPAP)
+        if h <= 0:
+            return 0.0
+        total = 0.0
+        for ch in AllAhiChannels:
+            total += self.count(ch)
+        return total / h
+
+    def calc_rdi(self) -> float:
+        """Calculate RDI (Respiratory Disturbance Index) = AHI + RERA."""
+        h = self.hours(MachineType.MT_CPAP)
+        if h <= 0:
+            return 0.0
+        total = 0.0
+        for ch in AllAhiChannels:
+            total += self.count(ch)
+        total += self.count(CPAP_RERA)
+        return total / h
+
+    def calc_idx(self, channel_id: ChannelID) -> float:
+        """Calculate generic index (count/hours) for a channel."""
+        return self.cph(channel_id)
+
+    def calc_ttia(self) -> float:
+        """Calculate total time in apnea (sum of event durations in seconds)."""
+        total = 0.0
+        for ch in AllAhiChannels:
+            total += self.sum_values(ch)
+        return total
+
+    # ---- Settings aggregation ----
+
+    def settings_min(self, channel_id: ChannelID) -> Optional[float]:
+        """Return minimum setting value across sessions."""
+        result = None
+        for s in self.get_sessions():
+            v = s.get_setting(channel_id)
+            if v is not None:
+                fv = float(v)
+                if result is None or fv < result:
+                    result = fv
+        return result
+
+    def settings_max(self, channel_id: ChannelID) -> Optional[float]:
+        """Return maximum setting value across sessions."""
+        result = None
+        for s in self.get_sessions():
+            v = s.get_setting(channel_id)
+            if v is not None:
+                fv = float(v)
+                if result is None or fv > result:
+                    result = fv
+        return result
+
+    def settings_avg(self, channel_id: ChannelID) -> Optional[float]:
+        """Return average setting value across sessions."""
+        total = 0.0
+        cnt = 0
+        for s in self.get_sessions():
+            v = s.get_setting(channel_id)
+            if v is not None:
+                total += float(v)
+                cnt += 1
+        return total / cnt if cnt > 0 else None
+
+    def settings_wavg(self, channel_id: ChannelID) -> Optional[float]:
+        """Return time-weighted average setting value."""
+        total = 0.0
+        weight = 0.0
+        for s in self.get_sessions():
+            v = s.get_setting(channel_id)
+            if v is not None:
+                h = s.hours()
+                if h > 0:
+                    total += float(v) * h
+                    weight += h
+        return total / weight if weight > 0 else None
+
+    def get_cpap_mode(self) -> int:
+        """Determine CPAP mode from session settings."""
+        for s in self.get_sessions(MachineType.MT_CPAP):
+            mode = s.get_setting(CPAP_Mode)
+            if mode is not None:
+                return int(mode)
+        return CPAPMode.MODE_UNKNOWN
+
+    def get_pressure_channel_id(self) -> ChannelID:
+        """Return the appropriate pressure channel based on CPAP mode."""
+        mode = self.get_cpap_mode()
+        if mode in (CPAPMode.MODE_BILEVEL_FIXED, CPAPMode.MODE_BILEVEL_AUTO_FIXED_PS,
+                     CPAPMode.MODE_BILEVEL_AUTO_VARIABLE_PS, CPAPMode.MODE_ASV,
+                     CPAPMode.MODE_ASV_VARIABLE_EPAP, CPAPMode.MODE_AVAPS):
+            return CPAP_IPAP
+        return CPAP_Pressure
+
+    # ---- Channel queries ----
+
+    def channel_exists(self, channel_id: ChannelID) -> bool:
+        """Check if any session has this channel."""
+        return any(s.channel_exists(channel_id) for s in self.get_sessions())
+
+    def channel_has_data(self, channel_id: ChannelID) -> bool:
+        """Check if any session has event data or summary data for channel."""
+        for s in self.get_sessions():
+            if s.channel_exists(channel_id):
+                return True
+            if channel_id in s._cnt and s._cnt[channel_id] > 0:
                 return True
         return False
+
+    # ---- Lazy loading ----
+
+    def open_summary(self) -> None:
+        """Ensure summary data is loaded for all sessions."""
+        for s in self.sessions:
+            if not s.summary_loaded:
+                s.load_summary()
+
+    def open_events(self) -> None:
+        """Ensure event data is loaded for all sessions."""
+        for s in self.sessions:
+            s.open_events()
+
+    def close_events(self) -> None:
+        """Release event data from memory for all sessions."""
+        for s in self.sessions:
+            s.trash_events()
 
 
 class Machine:

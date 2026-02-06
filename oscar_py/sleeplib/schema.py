@@ -531,6 +531,16 @@ ahiChannels: List[ChannelID] = [
     CPAP_Apnea,
 ]
 
+# All AHI-contributing channels including ExP (for Day.calc_ahi)
+AllAhiChannels: List[ChannelID] = [
+    CPAP_ClearAirway,
+    CPAP_Obstructive,
+    CPAP_Hypopnea,
+    CPAP_Apnea,
+    CPAP_AllApnea,
+    CPAP_ExP,
+]
+
 
 def init_channels() -> None:
     """Initialize the channel schema with default channels.
