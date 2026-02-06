@@ -51,3 +51,6 @@ doxydoc
 
 #SourceTrail files
 *.json
+
+Data/
+CLAUDE.md
