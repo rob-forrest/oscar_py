@@ -351,6 +351,27 @@ class EventList:
             indices = np.arange(self._count, dtype=np.float64)
             return (self._first + indices * self._rate).astype(np.int64)
 
+    def get_times_ms(self) -> np.ndarray:
+        """Get timestamps in milliseconds relative to first.
+
+        For waveforms, generates evenly spaced times based on rate.
+        For events, returns the stored time deltas.
+        Compatible with event_loader.EventList API.
+        """
+        if self._type == EventListType.EVL_Waveform:
+            return np.arange(self._count, dtype=np.float64) * self._rate
+        else:
+            if self._count > 0:
+                return self._time[:self._count].astype(np.float64)
+            return np.zeros(0, dtype=np.float64)
+
+    def get_values(self) -> np.ndarray:
+        """Get physical values with gain and offset applied.
+
+        Compatible with event_loader.EventList API.
+        """
+        return self._data[:self._count].astype(np.float64) * self._gain + self._offset
+
     # Data addition methods
 
     def add_event(self, time_ms: int, value: Union[int, float], value2: Optional[Union[int, float]] = None) -> None:

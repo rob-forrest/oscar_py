@@ -409,6 +409,17 @@ class Session:
         """
         return self._eventlist.get(channel_id)
 
+    def get_events(self, channel_id: ChannelID) -> Optional[List[EventList]]:
+        """Get event lists for a channel (alias for get_event_list).
+
+        Args:
+            channel_id: Channel ID to look up
+
+        Returns:
+            List of EventList objects, or None if channel not found
+        """
+        return self._eventlist.get(channel_id)
+
     def get_first_event_list(self, channel_id: ChannelID) -> Optional[EventList]:
         """Get the first EventList for a channel.
 

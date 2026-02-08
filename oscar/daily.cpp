@@ -416,7 +416,7 @@ Daily::Daily(QWidget *parent,gGraphView * shared)
     MinutesAtPressure * map;
     TAP2->AddLayer(map = new MinutesAtPressure());
     TAP2->AddLayer(new gLabelArea(map),LayerLeft,gYAxis::Margin);
-    TAP2->AddLayer(new gXAxisPressure(),LayerBottom,gXAxisPressure::Margin);
+    TAP2->AddLayer(new gXAxis(),LayerBottom,gXAxis::Margin);
     TAP2->setBlockSelect(true);
 
     // Fill in the AHI graph

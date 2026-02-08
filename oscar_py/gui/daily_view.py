@@ -18,6 +18,8 @@ import math
 from datetime import datetime, date, time, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
+import numpy as np
+
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -841,21 +843,24 @@ class DailyView(QWidget):
             pass
 
     def _load_and_display_waveforms(self) -> None:
-        """Load event data and display waveforms in GraphView."""
-        session = self._current_session
-        if session is None:
+        """Load event data and display waveforms in GraphView.
+
+        Iterates over ALL sessions for the current day (not just one),
+        concatenating data with NaN gaps between sessions so PyQtGraph
+        breaks the line at session boundaries.
+        """
+        if not self._sessions:
             return
 
-        # Load events if not already loaded
-        if hasattr(session, 'load_events'):
-            try:
-                session.load_events()
-            except Exception as e:
-                logger.warning(f"Failed to load events: {e}")
+        # Load events for all sessions
+        for session in self._sessions:
+            if hasattr(session, 'load_events'):
+                try:
+                    session.load_events()
+                except Exception as e:
+                    logger.warning(f"Failed to load events for session: {e}")
+            if not hasattr(session, 'get_events'):
                 return
-
-        if not hasattr(session, 'get_events'):
-            return
 
         # Clear existing graphs
         self.graph_area.clear()
@@ -886,17 +891,37 @@ class DailyView(QWidget):
             (CPAP_AHI, "AHI Graph", "AHI", "events/hr", QColor(200, 0, 0), 80),
         ]
 
-        session_start = session._first if hasattr(session, '_first') else 0
         graphs_added = 0
 
         for channel_id, name, y_label, y_unit, color, height in waveform_channels:
-            events = session.get_events(channel_id)
-            if not events:
-                continue
+            # Collect data from ALL sessions for this channel
+            all_times = []
+            all_values = []
 
-            # Get the first (usually only) event list for this channel
-            evlist = events[0]
-            if evlist.count == 0:
+            for session in self._sessions:
+                events = session.get_events(channel_id)
+                if not events:
+                    continue
+
+                evlist = events[0]
+                if evlist.count == 0:
+                    continue
+
+                times = evlist.get_times_ms()  # ms relative to evlist.first
+                values = evlist.get_values()    # Actual values with gain/offset
+
+                # Convert to absolute epoch ms for TimeAxisItem
+                times = times + evlist.first
+
+                # Insert NaN gap between sessions to break the line
+                if all_times:
+                    all_times.append(np.array([np.nan]))
+                    all_values.append(np.array([np.nan]))
+
+                all_times.append(times)
+                all_values.append(values)
+
+            if not all_times:
                 continue
 
             try:
@@ -909,22 +934,20 @@ class DailyView(QWidget):
                     color=color
                 )
 
-                # Get times and values
-                times = evlist.get_times_ms()  # ms from start of event list
-                values = evlist.get_values()   # Actual values with gain/offset
+                # Concatenate all sessions' data
+                concat_times = np.concatenate(all_times)
+                concat_values = np.concatenate(all_values)
 
-                # Adjust times to be relative to session start
-                if evlist.first > 0:
-                    times = times + (evlist.first - session_start)
-
-                # Set data on chart
-                chart.set_data(times, values, auto_range=True)
+                # Set data on chart — auto_range=False to avoid per-chart
+                # autoRange fighting with X-linked viewboxes.  reset_zoom()
+                # below sets the range once for all charts together.
+                chart.set_data(concat_times, concat_values, auto_range=False)
                 graphs_added += 1
 
             except Exception as e:
                 logger.warning(f"Failed to display {name}: {e}")
 
-        logger.info(f"Displayed {graphs_added} waveform channels")
+        logger.info(f"Displayed {graphs_added} waveform channels from {len(self._sessions)} sessions")
 
         # Add event flags overlay
         self._add_event_flags()
@@ -934,20 +957,20 @@ class DailyView(QWidget):
             self.graph_area.reset_zoom()
 
     def _add_event_flags(self) -> None:
-        """Add respiratory event flags to the graphs."""
-        session = self._current_session
-        if session is None or not hasattr(session, 'get_events'):
+        """Add respiratory event flags to the graphs.
+
+        Iterates over ALL sessions for the current day.
+        """
+        if not self._sessions:
             return
 
         # Event channels to display as flags
         event_channels = [
-            (0x1002, "OA", QColor(0, 180, 180)),    # Obstructive - Teal
-            (0x1001, "CA", QColor(180, 80, 200)),   # Central - Purple
-            (0x1003, "H", QColor(80, 80, 255)),     # Hypopnea - Blue
-            (0x1006, "RERA", QColor(255, 255, 80)), # RERA - Yellow
+            (0x1002, "OA", QColor(0, 180, 180, 76)),    # Obstructive - Teal
+            (0x1001, "CA", QColor(180, 80, 200, 76)),    # Central - Purple
+            (0x1003, "H", QColor(80, 80, 255, 76)),      # Hypopnea - Blue
+            (0x1006, "RERA", QColor(255, 255, 80, 76)),   # RERA - Yellow
         ]
-
-        session_start = session._first if hasattr(session, '_first') else 0
 
         # Get the first graph to add regions to (usually Flow Rate)
         flow_chart = self.graph_area.get_graph("Flow Rate")
@@ -955,30 +978,30 @@ class DailyView(QWidget):
             return
 
         for channel_id, label, color in event_channels:
-            events = session.get_events(channel_id)
-            if not events:
-                continue
+            for session in self._sessions:
+                if not hasattr(session, 'get_events'):
+                    continue
 
-            evlist = events[0]
-            if evlist.count == 0 or evlist.time is None:
-                continue
+                events = session.get_events(channel_id)
+                if not events:
+                    continue
 
-            # Add a region for each event
-            times = evlist.time.astype(float)  # ms offsets
-            if evlist.first > 0:
-                times = times + (evlist.first - session_start)
+                evlist = events[0]
+                if evlist.count == 0:
+                    continue
 
-            for t in times[:100]:  # Limit to first 100 events for performance
-                # Add a thin vertical region at each event time
-                try:
-                    flow_chart.add_region(
-                        start=t - 2000,  # 2 seconds before
-                        end=t + 2000,    # 2 seconds after
-                        color=color,
-                        alpha=0.3
-                    )
-                except Exception:
-                    pass  # Region adding may fail
+                # Convert to absolute epoch ms for TimeAxisItem
+                times = evlist.get_times_ms() + evlist.first
+
+                for t in times[:100]:  # Limit to first 100 events per session
+                    try:
+                        flow_chart.add_region(
+                            start_ms=t - 2000,  # 2 seconds before
+                            end_ms=t + 2000,     # 2 seconds after
+                            color=color,
+                        )
+                    except Exception:
+                        pass  # Region adding may fail
 
     def on_date_changed(self, selected_date: date) -> None:
         """Handle calendar selection (public slot).

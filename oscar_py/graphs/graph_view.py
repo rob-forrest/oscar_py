@@ -149,6 +149,7 @@ class GraphView(QWidget):
         self._sync_timer.setInterval(16)  # ~60fps
         self._sync_timer.timeout.connect(self._do_sync_x_axis)
         self._pending_range: Optional[Tuple[float, float]] = None
+        self._syncing: bool = False  # Guard against recursive sync
 
         # Setup UI
         self._setup_ui()
@@ -339,12 +340,18 @@ class GraphView(QWidget):
         self.timeRangeChanged.emit(start_ms, end_ms)
 
     def _apply_time_range(self) -> None:
-        """Apply the current time range to all charts."""
+        """Apply the current time range to all charts.
+
+        Sets the X range on every viewbox directly.  We do NOT use
+        PyQtGraph's setXLink because it silently overrides explicit
+        setXRange calls on linked viewboxes.  Instead, interactive
+        sync is handled by _on_chart_range_changed → _do_sync_x_axis.
+        """
+        self._syncing = True
         for panel in self._graphs.values():
             view_box = panel.chart.getPlotItem().getViewBox()
-            view_box.blockSignals(True)
             view_box.setXRange(self._time_start, self._time_end, padding=0)
-            view_box.blockSignals(False)
+        self._syncing = False
 
     def sync_x_axis(self) -> None:
         """Synchronize all graphs to the same time range.
@@ -381,26 +388,28 @@ class GraphView(QWidget):
             self._data_end = max_time
 
     def _link_x_axes(self) -> None:
-        """Link X-axes of all graphs for synchronized scrolling."""
-        if len(self._graphs) < 2:
-            return
+        """Link X-axes of all graphs for synchronized scrolling.
 
-        # Get first chart's view box as reference
-        panels = list(self._graphs.values())
-        reference_view = panels[0].chart.getPlotItem().getViewBox()
-
-        # Link all other charts to the reference
-        for panel in panels[1:]:
-            view_box = panel.chart.getPlotItem().getViewBox()
-            view_box.setXLink(reference_view)
+        We do NOT use PyQtGraph's setXLink because it silently
+        overrides explicit setXRange calls on linked viewboxes.
+        Instead, sync is driven by _on_chart_range_changed which
+        propagates any chart's X-range change to all others.
+        """
+        pass  # Sync handled by _on_chart_range_changed
 
     def _on_chart_range_changed(self, start_ms: float, end_ms: float) -> None:
         """Handle time range change from a chart.
+
+        Propagates the new X range to all other charts so they stay
+        synchronized (replaces PyQtGraph's setXLink).
 
         Args:
             start_ms: New start time
             end_ms: New end time
         """
+        if getattr(self, '_syncing', False):
+            return
+
         # Batch updates using timer
         self._pending_range = (start_ms, end_ms)
         if not self._sync_timer.isActive():
@@ -414,6 +423,9 @@ class GraphView(QWidget):
 
             self._time_start = start_ms
             self._time_end = end_ms
+
+            # Propagate to all charts
+            self._apply_time_range()
 
             # Emit signal
             self.timeRangeChanged.emit(start_ms, end_ms)
@@ -492,10 +504,19 @@ class GraphView(QWidget):
         self.zoom(1.0 - self.ZOOM_FACTOR, center_ms)
 
     def reset_zoom(self) -> None:
-        """Reset zoom to show all data."""
+        """Reset zoom to show all data.
+
+        Sets a consistent X range across all charts (from data bounds),
+        then auto-ranges each chart's Y axis independently.
+        """
         self._calculate_data_range()
         if self._data_start > 0 and self._data_end > 0:
             self.set_time_range(self._data_start, self._data_end)
+
+        # Auto-range Y axis for each chart independently
+        for panel in self._graphs.values():
+            view_box = panel.chart.getPlotItem().getViewBox()
+            view_box.enableAutoRange(axis='y')
 
     def pan(self, delta_ms: float) -> None:
         """Pan the view by a time delta.

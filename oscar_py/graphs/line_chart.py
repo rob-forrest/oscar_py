@@ -136,8 +136,11 @@ class LineChart(pg.PlotWidget):
         # Configure interaction
         self.setMouseEnabled(x=True, y=True)
 
-        # Enable auto-range initially
-        self.enableAutoRange()
+        # Do NOT call enableAutoRange() here — continuous auto-range
+        # fights with X-linked viewboxes when multiple charts are loaded
+        # sequentially, causing early charts to lose their X range.
+        # Instead, the caller should explicitly set the range after all
+        # charts are populated (via GraphView.reset_zoom()).
 
         # Connect range change signal
         self.sigXRangeChanged.connect(self._on_x_range_changed)
@@ -162,18 +165,12 @@ class LineChart(pg.PlotWidget):
         if len(times) != len(values):
             raise ValueError(f"times ({len(times)}) and values ({len(values)}) must have same length")
 
-        # Store original data
+        # Store data — no custom downsampling; PyQtGraph renders the
+        # full dataset directly (OpenGL handles 700K+ points fine).
         self._raw_times = np.asarray(times, dtype=np.float64)
         self._raw_values = np.asarray(values, dtype=np.float64)
-
-        # Apply downsampling if needed
-        if len(self._raw_times) > self.DOWNSAMPLE_THRESHOLD:
-            self._times, self._values = self._downsample(
-                self._raw_times, self._raw_values
-            )
-        else:
-            self._times = self._raw_times
-            self._values = self._raw_values
+        self._times = self._raw_times
+        self._values = self._raw_values
 
         # Update or create plot item
         self._update_plot_item()
@@ -215,10 +212,12 @@ class LineChart(pg.PlotWidget):
 
         Uses a min-max preserving algorithm that maintains the visual
         appearance of the waveform while reducing the number of points.
+        NaN values (session gap separators) are preserved as explicit
+        NaN entries in the result so connect='finite' breaks the line.
 
         Args:
-            times: Original timestamps
-            values: Original values
+            times: Original timestamps (may contain NaN gap separators)
+            values: Original values (may contain NaN gap separators)
 
         Returns:
             Tuple of (downsampled_times, downsampled_values)
@@ -238,11 +237,23 @@ class LineChart(pg.PlotWidget):
         times_binned = times[:truncated_len].reshape(n_bins, bin_size)
         values_binned = values[:truncated_len].reshape(n_bins, bin_size)
 
-        # For each bin, keep min and max values to preserve peaks
-        mins = values_binned.min(axis=1)
-        maxs = values_binned.max(axis=1)
+        # Use nanmin/nanmax so NaN separators don't corrupt entire bins.
+        # Bins that are ALL NaN will still produce NaN (preserving gaps).
+        with np.errstate(all='ignore'):
+            mins = np.nanmin(values_binned, axis=1)
+            maxs = np.nanmax(values_binned, axis=1)
         min_times = times_binned[:, 0]  # Use start of bin for min
         max_times = times_binned[:, 0]  # Use start of bin for max
+
+        # Mark bins that contained any NaN as NaN in times too,
+        # so connect='finite' breaks the line at session boundaries.
+        nan_bins = np.any(np.isnan(values_binned), axis=1)
+        min_times = min_times.copy()
+        max_times = max_times.copy()
+        min_times[nan_bins] = np.nan
+        max_times[nan_bins] = np.nan
+        mins[nan_bins] = np.nan
+        maxs[nan_bins] = np.nan
 
         # Interleave min and max values
         result_times = np.empty(n_bins * 2, dtype=np.float64)
@@ -269,7 +280,8 @@ class LineChart(pg.PlotWidget):
                 self._times,
                 self._values,
                 pen=pen,
-                antialias=True
+                antialias=True,
+                connect='finite'
             )
         else:
             # Update existing plot item
@@ -461,13 +473,24 @@ class LineChart(pg.PlotWidget):
 
     @property
     def data_range(self) -> Optional[Tuple[float, float, float, float]]:
-        """Return the data range as (x_min, x_max, y_min, y_max)."""
+        """Return the data range as (x_min, x_max, y_min, y_max).
+
+        Uses nanmin/nanmax to handle NaN gap separators between sessions.
+        """
         if self._raw_times is None or self._raw_values is None:
             return None
 
-        return (
-            float(self._raw_times.min()),
-            float(self._raw_times.max()),
-            float(self._raw_values.min()),
-            float(self._raw_values.max())
-        )
+        if len(self._raw_times) == 0:
+            return None
+
+        with np.errstate(all='ignore'):
+            x_min = float(np.nanmin(self._raw_times))
+            x_max = float(np.nanmax(self._raw_times))
+            y_min = float(np.nanmin(self._raw_values))
+            y_max = float(np.nanmax(self._raw_values))
+
+        # If all values are NaN, nanmin/nanmax return nan
+        if np.isnan(x_min) or np.isnan(x_max):
+            return None
+
+        return (x_min, x_max, y_min, y_max)

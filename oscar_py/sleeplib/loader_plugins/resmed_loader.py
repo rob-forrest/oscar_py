@@ -438,7 +438,14 @@ class EDFInfo:
     # Convenience properties
     @property
     def startdate(self) -> Optional[int]:
-        """Get start date as milliseconds since epoch."""
+        """Get start date as milliseconds since epoch.
+
+        Note: EDF timestamps are local time without timezone info.
+        datetime.timestamp() on a naive datetime interprets it as local time,
+        which is correct here since ResMed devices record in the user's
+        local timezone. This is consistent across all EDF file types
+        (BRP, PLD, EVE, etc.) so inter-channel alignment is unaffected.
+        """
         dt = self.header.startdatetime
         if dt:
             return int(dt.timestamp() * 1000)
